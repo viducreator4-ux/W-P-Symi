@@ -1,4 +1,5 @@
 import datetime
+import time
 import numpy as np
 import pandas as pd
 import requests
@@ -9,12 +10,39 @@ st.set_page_config(
     page_title="Ensemble Weather App", page_icon="🌊", layout="wide"
 )
 
+# --- ΕΛΕΓΧΟΣ ΚΩΔΙΚΟΥ ΠΡΟΣΒΑΣΗΣ ---
+def check_password():
+    if "APP_PASSWORD" not in st.secrets:
+        return True
+    if st.session_state.get("authenticated"):
+        return True
+
+    st.title("🔒 Ψαρευτική Πρόγνωση")
+    st.markdown("Βάλε τον κωδικό για να δεις την πρόγνωση.")
+
+    with st.form("login_form", clear_on_submit=False):
+        pwd = st.text_input("Κωδικός:", type="password", placeholder="••••••••")
+        submitted = st.form_submit_button("Είσοδος", type="primary")
+
+    if submitted:
+        if pwd == st.secrets["APP_PASSWORD"]:
+            st.session_state["authenticated"] = True
+            st.rerun()
+        else:
+            st.error("❌ Λάθος κωδικός. Δοκίμασε ξανά.")
+    return False
+
+
+if not check_password():
+    st.stop()
+# ----------------------------------
+
 # --- ΚΥΡΙΩΣ ΕΦΑΡΜΟΓΗ ---
 st.title("🌊 Πρόγνωση 14 Ημερών (Ensemble Consensus - 5 Μοντέλα)")
 st.markdown(
     "Στατιστική σύνθεση από ECMWF, GFS, ICON, GEM & Meteo-France. "
-    "Δείχνει **πότε συμφωνούν** τα μοντέλα και **πόσο αβέβαιη** "
-    "είναι κάθε πρόβλεψη."
+    "Η στήλη **Συμφωνία** δείχνει πόσο κοντά είναι τα 5 μοντέλα — "
+    "βασισμένη σε **robust** εκτίμηση (MAD) που αγνοεί outliers."
 )
 
 # --- SIDEBAR ---
@@ -37,20 +65,33 @@ else:
         "Γράψτε τοποθεσία (π.χ. Symi, Antalya):", value="Σύμη", max_chars=50
     )
 
+st.sidebar.markdown("---")
+if st.sidebar.button("🚪 Αποσύνδεση"):
+    st.session_state["authenticated"] = False
+    st.rerun()
+
 # --- ΣΤΑΘΕΡΕΣ ---
 MODELS = "ecmwf_ifs025,gfs_seamless,icon_seamless,gem_global,meteofrance_seamless"
 MIN_MODELS = 3
 
+# Το "scale" = η τυπική απόκλιση στην οποία θεωρούμε ότι τα μοντέλα
+# διαφωνούν πλήρως (agreement = 0%). Προέρχεται από φυσικά όρια:
+#   - Πίεση: 6 hPa = μεγάλη απόκλιση για synoptic κλίμακα
+#   - Άνεμος: 12 km/h ≈ 6.5 knots
+#   - Ριπές: 18 km/h
+#   - Βροχή: 3 mm σε 1 ώρα = σοβαρή διαφωνία
+#   - Θερμ.: 6°C
+#   - Διεύθυνση: 60° (κυκλικό)
 PARAMS = {
-    "pressure_msl":              {"label": "Πίεση (hPa)",      "scale": 6.0,  "weight": 0.20},
-    "wind_speed_10m":            {"label": "Άνεμος (km/h)",     "scale": 12.0, "weight": 0.20},
-    "wind_gusts_10m":            {"label": "Ριπές (km/h)",      "scale": 18.0, "weight": 0.15},
-    "precipitation":             {"label": "Βροχή (mm)",        "scale": 3.0,  "weight": 0.15},
-    "temperature_2m":            {"label": "Θερμ. (°C)",        "scale": 6.0,  "weight": 0.10},
-    "wind_direction_10m":        {"label": "Διεύθυνση (°)",      "scale": 60.0, "weight": 0.10},
-    "precipitation_probability": {"label": "Πιθαν. Βροχής (%)", "scale": 35.0, "weight": 0.05},
-    "cloud_cover":               {"label": "Νέφωση (%)",        "scale": 45.0, "weight": 0.05},
-    "relative_humidity_2m":      {"label": "Υγρασία (%)",       "scale": 25.0, "weight": 0.00},
+    "pressure_msl":              {"label": "Πίεση (hPa)",      "scale": 6.0,  "weight": 0.20, "important": True},
+    "wind_speed_10m":            {"label": "Άνεμος (km/h)",     "scale": 12.0, "weight": 0.20, "important": True},
+    "wind_gusts_10m":            {"label": "Ριπές (km/h)",      "scale": 18.0, "weight": 0.15, "important": True},
+    "precipitation":             {"label": "Βροχή (mm)",        "scale": 3.0,  "weight": 0.15, "important": True},
+    "temperature_2m":            {"label": "Θερμ. (°C)",        "scale": 6.0,  "weight": 0.10, "important": False},
+    "wind_direction_10m":        {"label": "Διεύθυνση (°)",      "scale": 60.0, "weight": 0.10, "important": False},
+    "precipitation_probability": {"label": "Πιθαν. Βροχής (%)", "scale": 35.0, "weight": 0.05, "important": False},
+    "cloud_cover":               {"label": "Νέφωση (%)",        "scale": 45.0, "weight": 0.05, "important": False},
+    "relative_humidity_2m":      {"label": "Υγρασία (%)",       "scale": 25.0, "weight": 0.00, "important": False},
 }
 
 GREEK_DAYS = {
@@ -83,6 +124,22 @@ def get_coordinates(name):
     return None, None, None, None, None
 
 
+def fetch_with_retry(url, max_retries=3, backoff=1.5, timeout=20):
+    """HTTP GET με retry + exponential backoff."""
+    last_error = None
+    for attempt in range(max_retries):
+        try:
+            response = requests.get(url, timeout=timeout)
+            response.raise_for_status()
+            return response.json()
+        except Exception as e:
+            last_error = e
+            if attempt < max_retries - 1:
+                time.sleep(backoff ** attempt)
+    st.error(f"Σφάλμα λήψης δεδομένων μετά από {max_retries} προσπάθειες: {last_error}")
+    return None
+
+
 def get_extended_fishing_weather(lat, lon, timezone):
     url = (
         f"https://api.open-meteo.com/v1/forecast?"
@@ -92,24 +149,34 @@ def get_extended_fishing_weather(lat, lon, timezone):
         f"wind_gusts_10m,wind_direction_10m,cloud_cover&"
         f"models={MODELS}&forecast_days=14&timezone={timezone}"
     )
-    try:
-        response = requests.get(url, timeout=20)
-        response.raise_for_status()
-        return response.json()
-    except Exception as e:
-        st.error(f"Σφάλμα λήψης δεδομένων: {e}")
-        return None
+    return fetch_with_retry(url)
 
 
-def circular_stats_deg(deg_df):
-    """Κυκλικό median + circular std (σε μοίρες) ανά γραμμή."""
+def circular_mean_std(deg_df):
+    """
+    Κυκλικός μέσος όρος + circular std (σε μοίρες).
+    ΣΗΜΕΙΩΣΗ: Είναι MEAN, όχι median — ο median δεν ορίζεται μονοσήμαντα
+    στον κύκλο. Ο circular mean είναι ο καθιερωμένος estimator στη μετεωρολογία.
+    """
     rad = np.deg2rad(deg_df.astype(float))
     cos_mean = np.cos(rad).mean(axis=1, skipna=True)
     sin_mean = np.sin(rad).mean(axis=1, skipna=True)
     R = np.sqrt(cos_mean**2 + sin_mean**2).clip(lower=1e-9, upper=1.0)
-    median_deg = (np.rad2deg(np.arctan2(sin_mean, cos_mean)) + 360) % 360
+    mean_deg = (np.rad2deg(np.arctan2(sin_mean, cos_mean)) + 360) % 360
+    # circular std: sqrt(-2 * ln(R)) σε radians, μετατροπή σε μοίρες
     std_deg = np.rad2deg(np.sqrt(-2 * np.log(R)))
-    return median_deg, std_deg
+    return mean_deg, std_deg
+
+
+def robust_spread(df_vals, median_vals):
+    """
+    Robust εκτίμηση διασποράς βασισμένη σε MAD.
+    MAD = median(|x_i - median(x)|)
+    Robust sigma ≈ 1.4826 * MAD (για κανονική κατανομή).
+    Ανθεκτικό σε outliers, σε αντίθεση με το std.
+    """
+    mad = df_vals.sub(median_vals, axis=0).abs().median(axis=1)
+    return 1.4826 * mad
 
 
 def compass_gr(deg):
@@ -119,10 +186,15 @@ def compass_gr(deg):
     return f"{COMPASS[idx]} {int(round(deg))}°"
 
 
-def agreement_emoji(val):
-    if pd.isna(val):
+def agreement_pct(spread, scale):
+    """Γραμμική μετατροπή spread → % συμφωνίας [0, 100]."""
+    return (100 * (1 - spread / scale)).clip(lower=0, upper=100)
+
+
+def agreement_emoji(pct):
+    if pd.isna(pct):
         return "—"
-    v = int(round(val))
+    v = int(round(pct))
     if v >= 75:
         return f"🟢 {v}%"
     if v >= 50:
@@ -135,12 +207,32 @@ def fmt_time(dt):
     return f"{day} {dt.strftime('%d/%m %H:%M')}"
 
 
-def fmt_pm(med, std):
+def fmt_pm(med, spread):
+    """Median ± robust spread."""
     if pd.isna(med):
         return "—"
-    if pd.isna(std):
+    if pd.isna(spread) or spread < 0.05:
         return f"{med:.1f}"
-    return f"{med:.1f} ± {std:.1f}"
+    return f"{med:.1f} ± {spread:.1f}"
+
+
+def fmt_range(min_v, max_v, decimals=1):
+    """Εύρος [min, max]."""
+    if pd.isna(min_v) or pd.isna(max_v):
+        return "—"
+    return f"[{min_v:.{decimals}f}, {max_v:.{decimals}f}]"
+
+
+def angular_diff(a, b):
+    """Ελάχιστη κυκλική απόσταση σε μοίρες (0-180)."""
+    d = abs(a - b) % 360
+    return min(d, 360 - d)
+
+
+def angular_diff_vec(a_series, b_series):
+    """Διανυσματική εκδοχή του angular_diff."""
+    d = (a_series - b_series).abs() % 360
+    return np.minimum(d, 360 - d)
 
 
 # --- ΚΥΡΙΩΣ ΡΟΗ ---
@@ -160,40 +252,72 @@ if location_query:
                 df = pd.DataFrame(raw_data["hourly"])
                 df["time"] = pd.to_datetime(df["time"])
 
+                # Ποιες παράμετροι είναι διαθέσιμες (έχουν στήλες μοντέλων)
+                available_params = {
+                    p: m for p, m in PARAMS.items()
+                    if any(c.startswith(p + "_") for c in df.columns)
+                }
+                if not available_params:
+                    st.error("Δεν βρέθηκαν διαθέσιμες παράμετροι στα δεδομένα.")
+                    st.stop()
+
                 consensus = pd.DataFrame()
                 consensus["Ώρα"] = df["time"]
 
-                # Πλήθος διαθέσιμων μοντέλων ανά ώρα
-                ref_cols = [c for c in df.columns if c.startswith("temperature_2m_")]
-                consensus["n_models"] = (
-                    df[ref_cols].notna().sum(axis=1) if ref_cols else 0
-                )
+                # Πλήθος διαθέσιμων μοντέλων ΑΝΑ ΠΑΡΑΜΕΤΡΟ
+                for param in available_params:
+                    model_cols = [
+                        c for c in df.columns if c.startswith(param + "_")
+                    ]
+                    consensus[f"{param}_n"] = df[model_cols].notna().sum(axis=1)
 
-                # Consensus + αβεβαιότητα ανά παράμετρο
-                for param, meta in PARAMS.items():
-                    model_cols = [c for c in df.columns if c.startswith(param + "_")]
+                # Πλήθος ελάχιστου across των "σημαντικών" παραμέτρων
+                important_params = [
+                    p for p, m in available_params.items() if m["important"]
+                ]
+                if important_params:
+                    n_cols = [f"{p}_n" for p in important_params]
+                    consensus["n_models_min"] = consensus[n_cols].min(axis=1)
+                else:
+                    all_n_cols = [f"{p}_n" for p in available_params]
+                    consensus["n_models_min"] = consensus[all_n_cols].min(axis=1)
+
+                # Consensus + spread ανά παράμετρο
+                for param, meta in available_params.items():
+                    model_cols = [
+                        c for c in df.columns if c.startswith(param + "_")
+                    ]
                     if not model_cols:
                         continue
 
                     if param == "wind_direction_10m":
-                        med, std = circular_stats_deg(df[model_cols])
-                        consensus[f"{param}_median"] = med
-                        consensus[f"{param}_std"] = std
+                        mean_deg, std_deg = circular_mean_std(df[model_cols])
+                        consensus[f"{param}_median"] = mean_deg
+                        consensus[f"{param}_spread"] = std_deg
                     else:
-                        consensus[f"{param}_median"] = df[model_cols].median(axis=1)
-                        consensus[f"{param}_std"] = df[model_cols].std(axis=1)
+                        median_v = df[model_cols].median(axis=1)
+                        consensus[f"{param}_median"] = median_v
+                        # Robust spread (MAD-based) — ανθεκτικό σε outliers
+                        consensus[f"{param}_spread"] = robust_spread(
+                            df[model_cols], median_v
+                        )
 
+                    # Εύρος [min, max] για διαφάνεια
                     consensus[f"{param}_min"] = df[model_cols].min(axis=1)
                     consensus[f"{param}_max"] = df[model_cols].max(axis=1)
 
-                    # Κανονικοποιημένη συμφωνία 0-1
-                    agree = (1 - consensus[f"{param}_std"] / meta["scale"]).clip(0, 1)
-                    consensus[f"{param}_agreement"] = agree
+                    # Κανονικοποιημένη συμφωνία 0-100
+                    consensus[f"{param}_agreement"] = agreement_pct(
+                        consensus[f"{param}_spread"], meta["scale"]
+                    )
 
-                # Συνολική σταθμισμένη συμφωνία 0-100
-                w_sum = sum(m["weight"] for m in PARAMS.values() if m["weight"] > 0)
+                # Συνολική σταθμισμένη συμφωνία
+                w_sum = sum(
+                    m["weight"] for m in available_params.values()
+                    if m["weight"] > 0
+                )
                 overall = None
-                for param, meta in PARAMS.items():
+                for param, meta in available_params.items():
                     if meta["weight"] == 0:
                         continue
                     col = f"{param}_agreement"
@@ -202,14 +326,22 @@ if location_query:
                     contrib = consensus[col].fillna(0) * meta["weight"]
                     overall = contrib if overall is None else overall + contrib
                 consensus["agreement"] = (
-                    (overall / w_sum * 100).round(0) if overall is not None else np.nan
+                    (overall / w_sum).round(0) if overall is not None else np.nan
                 )
 
-                # Τάση πίεσης (3ωρη)
-                consensus["pressure_trend"] = (
-                    consensus["pressure_msl_median"]
-                    - consensus["pressure_msl_median"].shift(3)
-                ).fillna(0)
+                # Τάση πίεσης — ΧΡΟΝΙΚΑ βασισμένη (3 ώρες), όχι 3 γραμμές
+                if "pressure_msl_median" in consensus.columns:
+                    consensus = consensus.sort_values("Ώρα").reset_index(drop=True)
+                    pressure_s = consensus.set_index("Ώρα")["pressure_msl_median"]
+                    trend_s = pressure_s - pressure_s.shift(freq="3h")
+                    consensus["pressure_trend"] = (
+                        trend_s.values.round(2)
+                    )
+                    consensus["pressure_trend"] = (
+                        consensus["pressure_trend"].fillna(0)
+                    )
+                else:
+                    consensus["pressure_trend"] = 0.0
 
                 # Φιλτράρισμα παρελθόντος + ελάχιστων μοντέλων
                 try:
@@ -218,10 +350,13 @@ if location_query:
                     now = pd.Timestamp.now(tz="UTC").tz_localize(None)
 
                 df_fc = consensus[consensus["Ώρα"] >= now].copy()
-                df_fc = df_fc[df_fc["n_models"] >= MIN_MODELS].copy()
+                df_fc = df_fc[df_fc["n_models_min"] >= MIN_MODELS].copy()
 
                 if df_fc.empty:
-                    st.warning("Δεν βρέθηκαν επαρκή δεδομένα για το μέλλον.")
+                    st.warning(
+                        "Δεν βρέθηκαν μελλοντικά δεδομένα με επαρκή αριθμό "
+                        "μοντέλων (≥3)."
+                    )
                 else:
                     # -------- ΜΕΤΡΙΚΕΣ ΚΟΡΥΦΗΣ --------
                     avg_agree = df_fc["agreement"].mean()
@@ -234,6 +369,12 @@ if location_query:
                     c2.metric("Ώρες υψηλής συμφωνίας 🟢", f"{high_agree}")
                     c3.metric("Ώρες χαμηλής συμφωνίας 🔴", f"{low_agree}")
                     c4.metric("Σύνολο ωρών", f"{total_hrs}")
+
+                    st.caption(
+                        "ℹ️ *Η συμφωνία υπολογίζεται από **MAD** (robust "
+                        "spread) και όχι από τυπική απόκλιση — αγνοεί μεμονωμένα "
+                        "μοντέλα που ξεφεύγουν.*"
+                    )
 
                     # -------- SLIDER --------
                     slider_max = len(df_fc)
@@ -258,111 +399,121 @@ if location_query:
                     # --- TAB 1: Σύνοψη ---
                     with tab1:
                         st.caption(
-                            "Σταθμισμένος median. Η στήλη **Συμφωνία** δείχνει "
-                            "πόσο κοντά είναι τα 5 μοντέλα μεταξύ τους."
+                            "Σταθμισμένος **robust median** ανά παράμετρο. "
+                            "Η στήλη **Συμφωνία** δείχνει πόσο κοντά είναι τα "
+                            "5 μοντέλα (🟢 ≥75%, 🟡 50-74%, 🔴 <50%)."
                         )
-                        summary = pd.DataFrame({
+                        summary_cols = {
                             "Ώρα": view["Ώρα"].apply(fmt_time),
-                            "Πίεση": view["pressure_msl_median"].round(1),
-                            "Τάση": view["pressure_trend"].round(1),
-                            "Άνεμος": view["wind_speed_10m_median"].round(1),
-                            "Ριπές": view["wind_gusts_10m_median"].round(1),
-                            "Δ/νση": view["wind_direction_10m_median"].apply(compass_gr),
-                            "Βροχή": view["precipitation_median"].round(2),
-                            "Πιθαν.%": view["precipitation_probability_median"].round(0).astype("Int64"),
-                            "Νέφωση": view["cloud_cover_median"].round(0).astype("Int64"),
-                            "Θερμ.": view["temperature_2m_median"].round(1),
-                            "Συμφωνία": view["agreement"].apply(agreement_emoji),
-                            "Μοντ.": view["n_models"].astype(int),
-                        })
-                        st.dataframe(summary, use_container_width=True, hide_index=True)
+                        }
+                        if "pressure_msl_median" in view.columns:
+                            summary_cols["Πίεση"] = view["pressure_msl_median"].round(1)
+                            summary_cols["Τάση/3h"] = view["pressure_trend"].round(2)
+                        if "wind_speed_10m_median" in view.columns:
+                            summary_cols["Άνεμος"] = view["wind_speed_10m_median"].round(1)
+                        if "wind_gusts_10m_median" in view.columns:
+                            summary_cols["Ριπές"] = view["wind_gusts_10m_median"].round(1)
+                        if "wind_direction_10m_median" in view.columns:
+                            summary_cols["Δ/νση"] = (
+                                view["wind_direction_10m_median"].apply(compass_gr)
+                            )
+                        if "precipitation_median" in view.columns:
+                            summary_cols["Βροχή"] = view["precipitation_median"].round(2)
+                        if "precipitation_probability_median" in view.columns:
+                            summary_cols["Πιθαν.%"] = (
+                                view["precipitation_probability_median"]
+                                .round(0).astype("Int64")
+                            )
+                        if "cloud_cover_median" in view.columns:
+                            summary_cols["Νέφωση"] = (
+                                view["cloud_cover_median"].round(0).astype("Int64")
+                            )
+                        if "temperature_2m_median" in view.columns:
+                            summary_cols["Θερμ."] = view["temperature_2m_median"].round(1)
+                        summary_cols["Συμφωνία"] = view["agreement"].apply(agreement_emoji)
+                        summary_cols["Μοντ."] = view["n_models_min"].astype(int)
+
+                        st.dataframe(
+                            pd.DataFrame(summary_cols),
+                            use_container_width=True,
+                            hide_index=True,
+                        )
 
                     # --- TAB 2: Αβεβαιότητα ---
                     with tab2:
                         st.caption(
-                            "Κάθε κελί: **median ± std** μεταξύ των 5 μοντέλων. "
-                            "Μεγάλο ± σημαίνει μεγάλη διαφωνία/αβεβαιότητα."
+                            "Κάθε κελί: **median ± robust spread (MAD)** "
+                            "και **[min, max]** μεταξύ των 5 μοντέλων. "
+                            "Μεγάλο spread ή ευρύ [min, max] = μεγάλη "
+                            "διαφωνία."
                         )
-                        unc = pd.DataFrame({
-                            "Ώρα": view["Ώρα"].apply(fmt_time),
-                            "Πίεση": [
-                                fmt_pm(m, s)
-                                for m, s in zip(
-                                    view["pressure_msl_median"],
-                                    view["pressure_msl_std"],
-                                )
-                            ],
-                            "Άνεμος": [
-                                fmt_pm(m, s)
-                                for m, s in zip(
-                                    view["wind_speed_10m_median"],
-                                    view["wind_speed_10m_std"],
-                                )
-                            ],
-                            "Ριπές": [
-                                fmt_pm(m, s)
-                                for m, s in zip(
-                                    view["wind_gusts_10m_median"],
-                                    view["wind_gusts_10m_std"],
-                                )
-                            ],
-                            "Δ/νση": [
+                        unc_cols = {"Ώρα": view["Ώρα"].apply(fmt_time)}
+
+                        def make_unc_cols(v, prefix, label, decimals=1):
+                            if f"{prefix}_median" not in v.columns:
+                                return None
+                            med = v[f"{prefix}_median"]
+                            spread = v[f"{prefix}_spread"]
+                            mn = v[f"{prefix}_min"]
+                            mx = v[f"{prefix}_max"]
+                            return [
+                                f"{fmt_pm(m, s)}  {fmt_range(lo, hi, decimals)}"
+                                for m, s, lo, hi in zip(med, spread, mn, mx)
+                            ]
+
+                        if "pressure_msl_median" in view.columns:
+                            unc_cols["Πίεση"] = make_unc_cols(
+                                view, "pressure_msl", "Πίεση", 1
+                            )
+                        if "wind_speed_10m_median" in view.columns:
+                            unc_cols["Άνεμος"] = make_unc_cols(
+                                view, "wind_speed_10m", "Άνεμος", 1
+                            )
+                        if "wind_gusts_10m_median" in view.columns:
+                            unc_cols["Ριπές"] = make_unc_cols(
+                                view, "wind_gusts_10m", "Ριπές", 1
+                            )
+                        if "precipitation_median" in view.columns:
+                            unc_cols["Βροχή"] = make_unc_cols(
+                                view, "precipitation", "Βροχή", 2
+                            )
+                        if "temperature_2m_median" in view.columns:
+                            unc_cols["Θερμ."] = make_unc_cols(
+                                view, "temperature_2m", "Θερμ.", 1
+                            )
+                        if "wind_direction_10m_median" in view.columns:
+                            unc_cols["Δ/νση"] = [
                                 f"{compass_gr(m)} ±{s:.0f}°"
                                 if not pd.isna(s) else compass_gr(m)
                                 for m, s in zip(
                                     view["wind_direction_10m_median"],
-                                    view["wind_direction_10m_std"],
+                                    view["wind_direction_10m_spread"],
                                 )
-                            ],
-                            "Βροχή": [
-                                fmt_pm(m, s)
-                                for m, s in zip(
-                                    view["precipitation_median"],
-                                    view["precipitation_std"],
-                                )
-                            ],
-                            "Πιθαν.%": [
-                                fmt_pm(m, s)
-                                for m, s in zip(
-                                    view["precipitation_probability_median"],
-                                    view["precipitation_probability_std"],
-                                )
-                            ],
-                            "Νέφωση": [
-                                fmt_pm(m, s)
-                                for m, s in zip(
-                                    view["cloud_cover_median"],
-                                    view["cloud_cover_std"],
-                                )
-                            ],
-                            "Θερμ.": [
-                                fmt_pm(m, s)
-                                for m, s in zip(
-                                    view["temperature_2m_median"],
-                                    view["temperature_2m_std"],
-                                )
-                            ],
-                            "Συμφωνία": view["agreement"].apply(agreement_emoji),
-                        })
-                        st.dataframe(unc, use_container_width=True, hide_index=True)
+                            ]
+                        unc_cols["Συμφωνία"] = view["agreement"].apply(agreement_emoji)
+
+                        st.dataframe(
+                            pd.DataFrame(unc_cols),
+                            use_container_width=True,
+                            hide_index=True,
+                        )
 
                     # --- TAB 3: Ανά Μοντέλο ---
                     with tab3:
                         st.caption(
                             "Δες τις ωμές τιμές κάθε μοντέλου για μια "
-                            "παράμετρο — χρήσιμο για να εντοπίσεις τον "
-                            "«αιρετικό»."
+                            "παράμετρο — χρήσιμο για εντοπισμό του "
+                            "«αιρετικού» μοντέλου."
                         )
                         param_choice = st.selectbox(
                             "Παράμετρος:",
-                            options=list(PARAMS.keys()),
-                            format_func=lambda p: PARAMS[p]["label"],
+                            options=list(available_params.keys()),
+                            format_func=lambda p: available_params[p]["label"],
                         )
-                        model_cols = [
+                        model_cols = sorted([
                             c for c in df.columns
                             if c.startswith(param_choice + "_")
-                        ]
-                        model_cols = sorted(model_cols)
+                        ])
                         if model_cols:
                             per_model = pd.DataFrame({
                                 "Ώρα": view["Ώρα"].apply(fmt_time).values,
@@ -376,10 +527,19 @@ if location_query:
                                     .replace("_global", "")
                                 )
                                 per_model[short] = raw[mc].values
-                            per_model["Διαφορά"] = (
-                                view[f"{param_choice}_max"]
-                                - view[f"{param_choice}_min"]
-                            ).round(2).values
+
+                            if param_choice == "wind_direction_10m":
+                                # Κυκλική διαφορά (σωστή!)
+                                diff = angular_diff_vec(
+                                    view[f"{param_choice}_max"],
+                                    view[f"{param_choice}_min"],
+                                )
+                                per_model["Κυκλ. Διαφ."] = diff.round(1).values
+                            else:
+                                per_model["Spread"] = (
+                                    view[f"{param_choice}_max"]
+                                    - view[f"{param_choice}_min"]
+                                ).round(2).values
                             per_model["Συμφωνία"] = (
                                 view["agreement"].apply(agreement_emoji).values
                             )
@@ -396,23 +556,31 @@ if location_query:
                         st.caption(
                             "Σύνοψη ανά ημέρα. Η **Συμφωνία** είναι ο μέσος "
                             "όρος των ωριαίων τιμών· η **Χειρότερη** δείχνει "
-                            "την πιο αβέβαιη ώρα της ημέρας."
+                            "την πιο αβέβαιη ώρα."
                         )
                         daily = view.copy()
                         daily["Ημέρα"] = daily["Ώρα"].dt.date
 
                         def daily_stats(g):
-                            return pd.Series({
-                                "Θερμ. min": g["temperature_2m_median"].min(),
-                                "Θερμ. max": g["temperature_2m_median"].max(),
-                                "Άνεμος max": g["wind_speed_10m_median"].max(),
-                                "Ριπές max": g["wind_gusts_10m_median"].max(),
-                                "Βροχή mm": g["precipitation_median"].sum(),
-                                "Πιθαν.% max": g["precipitation_probability_median"].max(),
+                            s = {
+                                "Ώρες": len(g),
                                 "Συμφωνία": g["agreement"].mean(),
                                 "Χειρότερη": g["agreement"].min(),
-                                "Ώρες": len(g),
-                            })
+                            }
+                            if "temperature_2m_median" in g.columns:
+                                s["Θερμ. min"] = g["temperature_2m_median"].min()
+                                s["Θερμ. max"] = g["temperature_2m_median"].max()
+                            if "wind_speed_10m_median" in g.columns:
+                                s["Άνεμος max"] = g["wind_speed_10m_median"].max()
+                            if "wind_gusts_10m_median" in g.columns:
+                                s["Ριπές max"] = g["wind_gusts_10m_median"].max()
+                            if "precipitation_median" in g.columns:
+                                s["Βροχή mm"] = g["precipitation_median"].sum()
+                            if "precipitation_probability_median" in g.columns:
+                                s["Πιθαν.% max"] = g[
+                                    "precipitation_probability_median"
+                                ].max()
+                            return pd.Series(s)
 
                         day_df = (
                             daily.groupby("Ημέρα").apply(daily_stats).reset_index()
@@ -423,9 +591,12 @@ if location_query:
                                 f" {d.strftime('%d/%m')}"
                             )
                         )
-                        for col in ["Θερμ. min", "Θερμ. max", "Άνεμος max",
-                                    "Ριπές max", "Βροχή mm", "Πιθαν.% max"]:
-                            day_df[col] = day_df[col].round(1)
+                        for col in [
+                            "Θερμ. min", "Θερμ. max", "Άνεμος max",
+                            "Ριπές max", "Βροχή mm", "Πιθαν.% max",
+                        ]:
+                            if col in day_df.columns:
+                                day_df[col] = day_df[col].round(1)
                         day_df["Συμφωνία"] = day_df["Συμφωνία"].apply(agreement_emoji)
                         day_df["Χειρότερη"] = day_df["Χειρότερη"].apply(agreement_emoji)
 
