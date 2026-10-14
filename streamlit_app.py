@@ -17,7 +17,7 @@ def check_password():
     if st.session_state.get("authenticated"):
         return True
 
-    st.title("🔒 Ψαρευτική Πρόγνωση")
+    st.title("🔒 Πρόγνωση Καιρού")
     st.markdown("Βάλε τον κωδικό για να δεις την πρόγνωση.")
 
     with st.form("login_form", clear_on_submit=False):
@@ -40,7 +40,7 @@ if not check_password():
 # --- ΚΥΡΙΩΣ ΕΦΑΡΜΟΓΗ ---
 st.title("🌊 Πρόγνωση 14 Ημερών (Ensemble Consensus - 5 Μοντέλα)")
 st.markdown(
-    "Στατιστική σύνθεση από ECMWF, GFS, ICON, GEM & Meteo-France. "
+    "Στατιστική σύνθεση από ECMWF, GFS, ICON, Meteo-France & UK Met Office. "
     "Η στήλη **Συμφωνία** δείχνει πόσο κοντά είναι τα 5 μοντέλα — "
     "βασισμένη σε **robust** εκτίμηση (MAD) που αγνοεί outliers."
 )
@@ -71,8 +71,18 @@ if st.sidebar.button("🚪 Αποσύνδεση"):
     st.rerun()
 
 # --- ΣΤΑΘΕΡΕΣ ---
-MODELS = "ecmwf_ifs025,gfs_seamless,icon_seamless,gem_global,meteofrance_seamless"
+# Σύνολο μοντέλων βελτιστοποιημένο για Ανατολική Μεσόγειο / Δωδεκάνησα:
+# - ECMWF IFS (9km):     ορίζοντας ~15 ημέρες, 4 ενημερώσεις/ημέρα
+# - GFS (13km):          ορίζοντας ~16 ημέρες, 4 ενημερώσεις/ημέρα
+# - ICON (7-13km):       ορίζοντας ~7.5 ημέρες, 4 ενημερώσεις/ημέρα
+# - Meteo-France ARPEGE: ορίζοντας ~4 ημέρες, 4 ενημερώσεις/ημέρα
+# - UKMO Global (10km):  ορίζοντας ~7 ημέρες, 4 ενημερώσεις/ημέρα
+#
+# ΣΗΜΑΝΤΙΚΟ: Πλήρης κάλυψη 14 ημερών παρέχεται μόνο από ECMWF + GFS.
+# Για τις ημέρες 8-14, τα ICON / Meteo-France / UKMO επιστρέφουν NaN.
+MODELS = "ecmwf_ifs025,gfs_seamless,icon_seamless,meteofrance_seamless,ukmo_seamless"
 MIN_MODELS = 3
+MIN_MODELS_EXTENDED = 2   # Χαλαρότερο όριο για ημέρες 8+
 
 PARAMS = {
     "pressure_msl":              {"label": "Πίεση (hPa)",      "scale": 6.0,  "weight": 0.20, "important": True},
@@ -83,7 +93,6 @@ PARAMS = {
     "wind_direction_10m":        {"label": "Διεύθυνση (°)",      "scale": 60.0, "weight": 0.10, "important": False},
     "precipitation_probability": {"label": "Πιθαν. Βροχής (%)", "scale": 35.0, "weight": 0.05, "important": False},
     "cloud_cover":               {"label": "Νέφωση (%)",        "scale": 45.0, "weight": 0.05, "important": False},
-    "relative_humidity_2m":      {"label": "Υγρασία (%)",       "scale": 25.0, "weight": 0.00, "important": False},
 }
 
 GREEK_DAYS = {
@@ -132,14 +141,15 @@ def fetch_with_retry(url, max_retries=3, backoff=1.5, timeout=20):
     return None
 
 
-def get_extended_fishing_weather(lat, lon, timezone):
+def get_ensemble_weather(lat, lon, timezone):
     url = (
         f"https://api.open-meteo.com/v1/forecast?"
         f"latitude={lat}&longitude={lon}&"
-        f"hourly=temperature_2m,relative_humidity_2m,precipitation,"
+        f"hourly=temperature_2m,precipitation,"
         f"precipitation_probability,pressure_msl,wind_speed_10m,"
         f"wind_gusts_10m,wind_direction_10m,cloud_cover&"
         f"models={MODELS}&forecast_days=14&timezone={timezone}"
+        f"&cell_selection=nearest"
     )
     return fetch_with_retry(url)
 
@@ -230,7 +240,7 @@ if location_query:
                 f"Συντεταγμένες: {lat:.3f}, {lon:.3f} | Ζώνη Ώρας: `{tz}`"
             )
 
-            raw_data = get_extended_fishing_weather(lat, lon, tz)
+            raw_data = get_ensemble_weather(lat, lon, tz)
 
             if raw_data and "hourly" in raw_data:
                 df = pd.DataFrame(raw_data["hourly"])
@@ -310,23 +320,21 @@ if location_query:
                     (overall / w_sum).round(0) if overall is not None else np.nan
                 )
 
-                # Τάση πίεσης — 3ωρη διαφορά βασισμένη σε ΩΡΕΣ
-                # Χρησιμοποιεί timedelta αντί για shift(periods) γιατί
-                # αν λείπουν ώρες από τα δεδομένα, το shift(3) θα ήταν λάθος.
+                # Τάση πίεσης — 3ωρη διαφορά
+                # Χρησιμοποιεί interpolate(method="time") αντί για asfreq()
+                # γιατί το asfreq εισάγει NaN στα κενά αντί να τα γεμίζει.
+                # Το interpolate γεμίζει τα κενά γραμμικά με βάση τον χρόνο,
+                # ώστε το .shift(3) να αντιστοιχεί πραγματικά σε 3 ώρες.
                 if "pressure_msl_median" in consensus.columns:
                     consensus = consensus.sort_values("Ώρα").reset_index(drop=True)
                     pressure_series = consensus.set_index("Ώρα")[
                         "pressure_msl_median"
                     ]
-                    # Resample σε ωριαίο index (γέμισμα κενών) και μετά diff 3h
-                    pressure_hourly = pressure_series.asfreq("1h")
-                    trend_3h = pressure_hourly - pressure_hourly.shift(3)
-                    # Ξαναφέρνουμε στο αρχικό index
-                    trend_aligned = trend_3h.reindex(
-                        consensus["Ώρα"].values
-                    )
+                    pressure_interp = pressure_series.interpolate(method="time")
+                    trend_3h = pressure_interp - pressure_interp.shift(3)
                     consensus["pressure_trend"] = (
-                        trend_aligned.values.round(2)
+                        trend_3h.reindex(consensus["Ώρα"].values)
+                        .values.round(2)
                     )
                     consensus["pressure_trend"] = (
                         consensus["pressure_trend"].fillna(0)
@@ -334,14 +342,29 @@ if location_query:
                 else:
                     consensus["pressure_trend"] = 0.0
 
-                # Φιλτράρισμα παρελθόντος + ελάχιστων μοντέλων
+                # Φιλτράρισμα παρελθόντος
                 try:
                     now = pd.Timestamp.now(tz=tz).tz_localize(None)
                 except Exception:
                     now = pd.Timestamp.now(tz="UTC").tz_localize(None)
 
                 df_fc = consensus[consensus["Ώρα"] >= now].copy()
-                df_fc = df_fc[df_fc["n_models_min"] >= MIN_MODELS].copy()
+
+                # Adaptive φίλτρο:
+                # - Ημέρες 1-7: απαιτούνται MIN_MODELS (3) μοντέλα
+                # - Ημέρες 8-14: αρκούν MIN_MODELS_EXTENDED (2) — συνήθως
+                #   ECMWF + GFS, γιατί τα ICON / Meteo-France / UKMO δεν
+                #   φτάνουν στις 14 ημέρες.
+                df_fc["hours_from_start"] = (
+                    df_fc["Ώρα"] - df_fc["Ώρα"].min()
+                ).dt.total_seconds() / 3600
+
+                base_ok = df_fc["n_models_min"] >= MIN_MODELS
+                extended_ok = (
+                    (df_fc["hours_from_start"] > 168)  # >7 ημέρες
+                    & (df_fc["n_models_min"] >= MIN_MODELS_EXTENDED)
+                )
+                df_fc = df_fc[base_ok | extended_ok].copy()
 
                 if df_fc.empty:
                     st.warning(
@@ -349,17 +372,34 @@ if location_query:
                         "μοντέλων (≥3)."
                     )
                 else:
+                    # -------- ΠΡΟΕΙΔΟΠΟΙΗΣΗ ΕΚΤΕΤΑΜΕΝΗΣ ΠΡΟΓΝΩΣΗΣ --------
+                    extended_low = df_fc[
+                        (df_fc["hours_from_start"] > 168)
+                        & (df_fc["n_models_min"] < MIN_MODELS)
+                    ]
+                    if len(extended_low) > 0:
+                        st.warning(
+                            f"⚠️ **Εκτεταμένη πρόγνωση (ημέρες 8-14)**: Για "
+                            f"{len(extended_low)} ώρες, λιγότερα από "
+                            f"{MIN_MODELS} μοντέλα παρέχουν δεδομένα "
+                            f"(συνήθως μόνο ECMWF + GFS, καθώς τα ICON / "
+                            f"Meteo-France / UKMO έχουν μικρότερο ορίζοντα). "
+                            f"Αυτές οι προγνώσεις είναι λιγότερο αξιόπιστες."
+                        )
+
                     # -------- ΜΕΤΡΙΚΕΣ ΚΟΡΥΦΗΣ --------
                     avg_agree = df_fc["agreement"].mean()
                     high_agree = int((df_fc["agreement"] >= 75).sum())
                     low_agree = int((df_fc["agreement"] < 50).sum())
                     total_hrs = len(df_fc)
+                    avg_coverage = df_fc["n_models_min"].mean()
 
-                    c1, c2, c3, c4 = st.columns(4)
+                    c1, c2, c3, c4, c5 = st.columns(5)
                     c1.metric("Μέση συμφωνία", f"{avg_agree:.0f}%")
                     c2.metric("Ώρες υψηλής συμφωνίας 🟢", f"{high_agree}")
                     c3.metric("Ώρες χαμηλής συμφωνίας 🔴", f"{low_agree}")
                     c4.metric("Σύνολο ωρών", f"{total_hrs}")
+                    c5.metric("Μέση κάλυψη μοντέλων", f"{avg_coverage:.1f}/5")
 
                     st.caption(
                         "ℹ️ *Η συμφωνία υπολογίζεται από **MAD** (robust "
@@ -595,12 +635,16 @@ if location_query:
                         )
 
                     # -------- CSV --------
-                    csv = df_fc.to_csv(index=False, encoding="utf-8-sig")
+                    # Καθαρισμός βοηθητικής στήλης πριν την εξαγωγή
+                    csv_df = df_fc.drop(
+                        columns=["hours_from_start"], errors="ignore"
+                    )
+                    csv = csv_df.to_csv(index=False, encoding="utf-8-sig")
                     st.download_button(
                         label=f"📥 Λήψη CSV 14 ημερών για {resolved_name}",
                         data=csv,
                         file_name=(
-                            f"{resolved_name.lower()}_ensemble_14d_"
+                            f"{resolved_name.lower()}_forecast_14d_"
                             f"{datetime.date.today().strftime('%Y%m%d')}.csv"
                         ),
                         mime="text/csv",
