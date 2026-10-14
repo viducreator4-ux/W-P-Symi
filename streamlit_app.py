@@ -74,14 +74,6 @@ if st.sidebar.button("🚪 Αποσύνδεση"):
 MODELS = "ecmwf_ifs025,gfs_seamless,icon_seamless,gem_global,meteofrance_seamless"
 MIN_MODELS = 3
 
-# Το "scale" = η τυπική απόκλιση στην οποία θεωρούμε ότι τα μοντέλα
-# διαφωνούν πλήρως (agreement = 0%). Προέρχεται από φυσικά όρια:
-#   - Πίεση: 6 hPa = μεγάλη απόκλιση για synoptic κλίμακα
-#   - Άνεμος: 12 km/h ≈ 6.5 knots
-#   - Ριπές: 18 km/h
-#   - Βροχή: 3 mm σε 1 ώρα = σοβαρή διαφωνία
-#   - Θερμ.: 6°C
-#   - Διεύθυνση: 60° (κυκλικό)
 PARAMS = {
     "pressure_msl":              {"label": "Πίεση (hPa)",      "scale": 6.0,  "weight": 0.20, "important": True},
     "wind_speed_10m":            {"label": "Άνεμος (km/h)",     "scale": 12.0, "weight": 0.20, "important": True},
@@ -155,15 +147,14 @@ def get_extended_fishing_weather(lat, lon, timezone):
 def circular_mean_std(deg_df):
     """
     Κυκλικός μέσος όρος + circular std (σε μοίρες).
-    ΣΗΜΕΙΩΣΗ: Είναι MEAN, όχι median — ο median δεν ορίζεται μονοσήμαντα
-    στον κύκλο. Ο circular mean είναι ο καθιερωμένος estimator στη μετεωρολογία.
+    Χρήση circular mean αντί median γιατί ο median δεν ορίζεται
+    μονοσήμαντα στον κύκλο (350° και 10° έχουν median 180° λανθασμένα).
     """
     rad = np.deg2rad(deg_df.astype(float))
     cos_mean = np.cos(rad).mean(axis=1, skipna=True)
     sin_mean = np.sin(rad).mean(axis=1, skipna=True)
     R = np.sqrt(cos_mean**2 + sin_mean**2).clip(lower=1e-9, upper=1.0)
     mean_deg = (np.rad2deg(np.arctan2(sin_mean, cos_mean)) + 360) % 360
-    # circular std: sqrt(-2 * ln(R)) σε radians, μετατροπή σε μοίρες
     std_deg = np.rad2deg(np.sqrt(-2 * np.log(R)))
     return mean_deg, std_deg
 
@@ -171,8 +162,7 @@ def circular_mean_std(deg_df):
 def robust_spread(df_vals, median_vals):
     """
     Robust εκτίμηση διασποράς βασισμένη σε MAD.
-    MAD = median(|x_i - median(x)|)
-    Robust sigma ≈ 1.4826 * MAD (για κανονική κατανομή).
+    MAD = median(|x_i - median(x)|), robust sigma ≈ 1.4826 * MAD.
     Ανθεκτικό σε outliers, σε αντίθεση με το std.
     """
     mad = df_vals.sub(median_vals, axis=0).abs().median(axis=1)
@@ -223,14 +213,8 @@ def fmt_range(min_v, max_v, decimals=1):
     return f"[{min_v:.{decimals}f}, {max_v:.{decimals}f}]"
 
 
-def angular_diff(a, b):
-    """Ελάχιστη κυκλική απόσταση σε μοίρες (0-180)."""
-    d = abs(a - b) % 360
-    return min(d, 360 - d)
-
-
 def angular_diff_vec(a_series, b_series):
-    """Διανυσματική εκδοχή του angular_diff."""
+    """Ελάχιστη κυκλική απόσταση (0-180 μοίρες)."""
     d = (a_series - b_series).abs() % 360
     return np.minimum(d, 360 - d)
 
@@ -252,7 +236,7 @@ if location_query:
                 df = pd.DataFrame(raw_data["hourly"])
                 df["time"] = pd.to_datetime(df["time"])
 
-                # Ποιες παράμετροι είναι διαθέσιμες (έχουν στήλες μοντέλων)
+                # Ποιες παράμετροι είναι διαθέσιμες
                 available_params = {
                     p: m for p, m in PARAMS.items()
                     if any(c.startswith(p + "_") for c in df.columns)
@@ -271,7 +255,7 @@ if location_query:
                     ]
                     consensus[f"{param}_n"] = df[model_cols].notna().sum(axis=1)
 
-                # Πλήθος ελάχιστου across των "σημαντικών" παραμέτρων
+                # Πλήθος ελάχιστου across σημαντικών παραμέτρων
                 important_params = [
                     p for p, m in available_params.items() if m["important"]
                 ]
@@ -297,16 +281,13 @@ if location_query:
                     else:
                         median_v = df[model_cols].median(axis=1)
                         consensus[f"{param}_median"] = median_v
-                        # Robust spread (MAD-based) — ανθεκτικό σε outliers
                         consensus[f"{param}_spread"] = robust_spread(
                             df[model_cols], median_v
                         )
 
-                    # Εύρος [min, max] για διαφάνεια
                     consensus[f"{param}_min"] = df[model_cols].min(axis=1)
                     consensus[f"{param}_max"] = df[model_cols].max(axis=1)
 
-                    # Κανονικοποιημένη συμφωνία 0-100
                     consensus[f"{param}_agreement"] = agreement_pct(
                         consensus[f"{param}_spread"], meta["scale"]
                     )
@@ -329,13 +310,23 @@ if location_query:
                     (overall / w_sum).round(0) if overall is not None else np.nan
                 )
 
-                # Τάση πίεσης — ΧΡΟΝΙΚΑ βασισμένη (3 ώρες), όχι 3 γραμμές
+                # Τάση πίεσης — 3ωρη διαφορά βασισμένη σε ΩΡΕΣ
+                # Χρησιμοποιεί timedelta αντί για shift(periods) γιατί
+                # αν λείπουν ώρες από τα δεδομένα, το shift(3) θα ήταν λάθος.
                 if "pressure_msl_median" in consensus.columns:
                     consensus = consensus.sort_values("Ώρα").reset_index(drop=True)
-                    pressure_s = consensus.set_index("Ώρα")["pressure_msl_median"]
-                    trend_s = pressure_s - pressure_s.shift(freq="3h")
+                    pressure_series = consensus.set_index("Ώρα")[
+                        "pressure_msl_median"
+                    ]
+                    # Resample σε ωριαίο index (γέμισμα κενών) και μετά diff 3h
+                    pressure_hourly = pressure_series.asfreq("1h")
+                    trend_3h = pressure_hourly - pressure_hourly.shift(3)
+                    # Ξαναφέρνουμε στο αρχικό index
+                    trend_aligned = trend_3h.reindex(
+                        consensus["Ώρα"].values
+                    )
                     consensus["pressure_trend"] = (
-                        trend_s.values.round(2)
+                        trend_aligned.values.round(2)
                     )
                     consensus["pressure_trend"] = (
                         consensus["pressure_trend"].fillna(0)
@@ -372,8 +363,8 @@ if location_query:
 
                     st.caption(
                         "ℹ️ *Η συμφωνία υπολογίζεται από **MAD** (robust "
-                        "spread) και όχι από τυπική απόκλιση — αγνοεί μεμονωμένα "
-                        "μοντέλα που ξεφεύγουν.*"
+                        "spread) και όχι από τυπική απόκλιση — αγνοεί "
+                        "μεμονωμένα μοντέλα που ξεφεύγουν.*"
                     )
 
                     # -------- SLIDER --------
@@ -400,8 +391,8 @@ if location_query:
                     with tab1:
                         st.caption(
                             "Σταθμισμένος **robust median** ανά παράμετρο. "
-                            "Η στήλη **Συμφωνία** δείχνει πόσο κοντά είναι τα "
-                            "5 μοντέλα (🟢 ≥75%, 🟡 50-74%, 🔴 <50%)."
+                            "Η στήλη **Συμφωνία** δείχνει πόσο κοντά είναι "
+                            "τα 5 μοντέλα (🟢 ≥75%, 🟡 50-74%, 🔴 <50%)."
                         )
                         summary_cols = {
                             "Ώρα": view["Ώρα"].apply(fmt_time),
@@ -449,7 +440,7 @@ if location_query:
                         )
                         unc_cols = {"Ώρα": view["Ώρα"].apply(fmt_time)}
 
-                        def make_unc_cols(v, prefix, label, decimals=1):
+                        def make_unc_cols(v, prefix, decimals=1):
                             if f"{prefix}_median" not in v.columns:
                                 return None
                             med = v[f"{prefix}_median"]
@@ -463,23 +454,23 @@ if location_query:
 
                         if "pressure_msl_median" in view.columns:
                             unc_cols["Πίεση"] = make_unc_cols(
-                                view, "pressure_msl", "Πίεση", 1
+                                view, "pressure_msl", 1
                             )
                         if "wind_speed_10m_median" in view.columns:
                             unc_cols["Άνεμος"] = make_unc_cols(
-                                view, "wind_speed_10m", "Άνεμος", 1
+                                view, "wind_speed_10m", 1
                             )
                         if "wind_gusts_10m_median" in view.columns:
                             unc_cols["Ριπές"] = make_unc_cols(
-                                view, "wind_gusts_10m", "Ριπές", 1
+                                view, "wind_gusts_10m", 1
                             )
                         if "precipitation_median" in view.columns:
                             unc_cols["Βροχή"] = make_unc_cols(
-                                view, "precipitation", "Βροχή", 2
+                                view, "precipitation", 2
                             )
                         if "temperature_2m_median" in view.columns:
                             unc_cols["Θερμ."] = make_unc_cols(
-                                view, "temperature_2m", "Θερμ.", 1
+                                view, "temperature_2m", 1
                             )
                         if "wind_direction_10m_median" in view.columns:
                             unc_cols["Δ/νση"] = [
@@ -529,7 +520,6 @@ if location_query:
                                 per_model[short] = raw[mc].values
 
                             if param_choice == "wind_direction_10m":
-                                # Κυκλική διαφορά (σωστή!)
                                 diff = angular_diff_vec(
                                     view[f"{param_choice}_max"],
                                     view[f"{param_choice}_min"],
